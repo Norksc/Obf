@@ -32,6 +32,9 @@ pub fn assemble_loader(payload: &ProtectedPayload) -> String {
     let bc_serialized = serialize_bytecode(&payload.bytecode);
     let watermark = "Protected by Drk V3";
     let encoded_opcodes = encode_opcode_map(&payload.bytecode.opcode_map);
+    let guard_checksum = payload.guard.checksum;
+    let guard_decoy = payload.guard.decoy_pool;
+    let guard_seed = payload.guard.polymorph_seed;
     format!(
         r#"local json = require('game'):Service('HttpService')
 local bit = bit32
@@ -63,6 +66,22 @@ loader.nonce = '{nonce}'
 loader.key = '{key}'
 loader.watermark = '{watermark}'
 loader.opcodes = '{opcodes}'
+loader.guard_checksum = {guard_checksum}
+loader.guard_decoy = {guard_decoy}
+loader.guard_seed = {guard_seed}
+local function checksum(payload)
+    local acc = 0xA5A55A5AF0F0C3C3
+    for i = 1, #payload do
+        local b = string.byte(payload, i)
+        acc = ((acc + b) % 2^64)
+        acc = bit.lrotate(acc, 9) ~ 0xDEADBEEF
+    end
+    return acc
+end
+local computed = checksum('{bc}')
+if computed ~= loader.guard_checksum then
+    while true do end
+end
 function loader.run()
     local decoded = json:JSONDecode('{bc}')
     local aes = require('drk_aes')
@@ -78,6 +97,9 @@ return loader
         key = payload.opaque_key,
         watermark = watermark,
         opcodes = encoded_opcodes,
+        guard_checksum = guard_checksum,
+        guard_decoy = guard_decoy,
+        guard_seed = guard_seed,
         bc = bc_serialized,
     )
 }

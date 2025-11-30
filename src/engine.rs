@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use aes_gcm::{aead::Aead, aead::KeyInit, Aes256Gcm, Nonce};
 use base64::{engine::general_purpose, Engine as _};
-use rand::rngs::OsRng;
+use rand::rngs::{OsRng, StdRng};
 use rand::seq::SliceRandom;
-use rand::RngCore;
+use rand::{RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -53,6 +53,7 @@ pub struct ProtectedPayload {
     pub nonce: String,
     pub opaque_key: String,
     pub stats: ProtectStats,
+    pub guard: GuardArtifacts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +61,13 @@ pub struct ProtectStats {
     pub junk_injected: usize,
     pub flattened_blocks: usize,
     pub string_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardArtifacts {
+    pub checksum: u64,
+    pub polymorph_seed: u64,
+    pub decoy_pool: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +378,29 @@ fn inject_junk(map: &HashMap<Opcode, u8>, code: &mut Vec<Instruction>, count: us
     code.len() - before
 }
 
+fn insert_control_noise(
+    map: &HashMap<Opcode, u8>,
+    code: &mut Vec<Instruction>,
+    polymorph_seed: u64,
+) {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(polymorph_seed);
+    // Walk the code and inject pseudo-random state swaps that keep behavior neutral.
+    for (idx, slot) in code.iter().enumerate() {
+        let wobble = rng.next_u64() as i32;
+        if idx % 5 == 0 {
+            code.insert(
+                idx,
+                Instruction {
+                    opcode: *map.get(&Opcode::Move).unwrap(),
+                    a: slot.a ^ (wobble & 0xFF) as i32,
+                    b: slot.a,
+                    c: 0,
+                },
+            );
+        }
+    }
+}
+
 fn encrypt_strings(strings: &[String]) -> Result<(String, String, String), EngineError> {
     let key = {
         let mut bytes = [0u8; 32];
@@ -396,6 +427,24 @@ fn encrypt_strings(strings: &[String]) -> Result<(String, String, String), Engin
     ))
 }
 
+fn checksum_instructions(code: &[Instruction], strings: &[String]) -> u64 {
+    let mut acc: u64 = 0xA5A5_5A5A_F0F0_C3C3;
+    for inst in code {
+        acc = acc
+            .wrapping_add(inst.opcode as u64)
+            .wrapping_mul(0x9E37_79B9)
+            ^ (inst.a as u64).rotate_left(13)
+            ^ (inst.b as u64).rotate_right(7)
+            ^ (inst.c as u64).rotate_left(3);
+    }
+    for s in strings {
+        for b in s.as_bytes() {
+            acc = acc.wrapping_add(*b as u64).rotate_left(9) ^ 0xDEADBEEFCAFEBABEu64;
+        }
+    }
+    acc
+}
+
 pub fn protect_script(
     bytes: Vec<u8>,
     level: crate::ProtectionLevel,
@@ -411,6 +460,12 @@ pub fn protect_script(
         crate::ProtectionLevel::Heavy => 6,
     };
     let junk_injected = inject_junk(&opcode_map, &mut code, junk);
+    let polymorph_seed = {
+        let mut seed_bytes = [0u8; 8];
+        OsRng.fill_bytes(&mut seed_bytes);
+        u64::from_le_bytes(seed_bytes)
+    };
+    insert_control_noise(&opcode_map, &mut code, polymorph_seed);
     let (encrypted_strings, opaque_key, nonce) = encrypt_strings(&strings)?;
 
     let bytecode = Bytecode {
@@ -426,11 +481,18 @@ pub fn protect_script(
         string_count: strings.len(),
     };
 
+    let guard = GuardArtifacts {
+        checksum: checksum_instructions(&code, &strings),
+        polymorph_seed,
+        decoy_pool: strings.len().saturating_mul(2) + junk_injected,
+    };
+
     Ok(ProtectedPayload {
         bytecode,
         encrypted_strings,
         nonce,
         opaque_key,
         stats,
+        guard,
     })
 }
