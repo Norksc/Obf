@@ -1,9 +1,12 @@
+use crc32fast::Hasher as Crc32;
 use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Read};
+
+const KEY_SEED: u32 = 0x5123_4567;
 
 const CANONICAL_OPS: [OpCode; 8] = [
     OpCode::LoadK,
@@ -276,6 +279,38 @@ impl EncodedProgram {
     }
 }
 
+struct CipheredProgram {
+    ciphertext: Vec<u8>,
+    total_bits: usize,
+    crc32: u32,
+    key: u64,
+}
+
+struct XorShift32 {
+    state: u32,
+}
+
+impl XorShift32 {
+    fn new(seed: u32) -> Self {
+        let init = seed ^ KEY_SEED;
+        Self {
+            state: (init | 1) & 0xFFFF_FFFF,
+        }
+    }
+
+    fn next(&mut self) -> u32 {
+        self.state ^= self.state << 7;
+        self.state ^= self.state >> 9;
+        self.state ^= self.state << 8;
+        self.state &= 0xFFFF_FFFF;
+        self.state
+    }
+
+    fn next_byte(&mut self) -> u8 {
+        (self.next() & 0xFF) as u8
+    }
+}
+
 fn ensure_reg_bits(reg: u8) -> Result<u8, Box<dyn Error>> {
     if reg < MAX_REGS {
         Ok(reg & REG_MASK)
@@ -355,12 +390,31 @@ fn encode_program(
     Ok(EncodedProgram { bytes, total_bits })
 }
 
-fn compile(input: &str, seed: u64) -> Result<(EncodedProgram, DynamicOpcodeMap), Box<dyn Error>> {
+fn obfuscate_program(encoded: EncodedProgram, seed: u32) -> CipheredProgram {
+    let mut keystream = XorShift32::new(seed);
+    let mut crc = Crc32::new();
+    let mut ciphertext = Vec::with_capacity(encoded.bytes.len());
+    for &byte in encoded.bytes.iter() {
+        let k = keystream.next_byte();
+        let obf = byte ^ k;
+        crc.update(&[obf]);
+        ciphertext.push(obf);
+    }
+    CipheredProgram {
+        ciphertext,
+        total_bits: encoded.total_bits,
+        crc32: crc.finalize(),
+        key: (seed ^ KEY_SEED) as u64,
+    }
+}
+
+fn compile(input: &str, seed: u32) -> Result<(CipheredProgram, DynamicOpcodeMap), Box<dyn Error>> {
     let mut parser = Parser::new();
     let program = parser.parse_program(input)?;
     let mapping = DynamicOpcodeMap::new(seed);
     let encoded = encode_program(&program, &mapping)?;
-    Ok((encoded, mapping))
+    let ciphered = obfuscate_program(encoded, seed);
+    Ok((ciphered, mapping))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -370,8 +424,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         input = DEFAULT_SAMPLE.to_string();
     }
 
-    let seed = 0xBAD5EED;
-    let (encoded, mapping) = compile(&input, seed)?;
+    let seed: u32 = 0x0BAD_5EED;
+    let (ciphered, mapping) = compile(&input, seed)?;
 
     println!(";; Dynamic opcode map (canonical -> randomized id)");
     for op in CANONICAL_OPS {
@@ -379,11 +433,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!(
-        "\n;; Encoded program ({} bits, {} bytes)",
-        encoded.total_bits,
-        encoded.bytes.len()
+        "\n;; Obfuscated program ({} bits, {} bytes)",
+        ciphered.total_bits,
+        ciphered.ciphertext.len()
     );
-    println!("{}", encoded.to_hex_string());
+    println!(";; XOR keystream key: 0x{:016X}", ciphered.key);
+    println!(";; CRC32 of ciphertext: 0x{:08X}", ciphered.crc32);
+    println!(
+        "{}",
+        EncodedProgram {
+            bytes: ciphered.ciphertext.clone(),
+            total_bits: ciphered.total_bits
+        }
+        .to_hex_string()
+    );
 
     Ok(())
 }

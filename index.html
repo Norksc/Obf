@@ -125,7 +125,7 @@
 <body>
   <header>
     <div class="title">High-Efficiency Lua → Custom ISA Compiler</div>
-    <div class="badge">Dynamic Opcode Mapping · Bit-Packed</div>
+    <div class="badge">Dynamic Opcode Mapping · Bit-Packed · XOR Guarded</div>
   </header>
 
   <div class="grid">
@@ -142,6 +142,8 @@ return c</textarea>
     <section>
       <h2>Binary Output</h2>
       <div class="pill" id="bitStats">0 bits · 0 bytes</div>
+      <div class="pill" id="keyView">Key: n/a</div>
+      <div class="pill" id="crcView">CRC32: n/a</div>
       <pre class="output" id="hex"></pre>
       <table id="opcodeTable"></table>
     </section>
@@ -162,6 +164,24 @@ return c</textarea>
         [pool[i], pool[r]] = [pool[r], pool[i]];
       }
       return pool.slice(0, limit);
+    }
+
+    const KEY_SEED = 0x51234567n;
+    class XorShift64 {
+      constructor(seed) {
+        const mixed = (seed ^ KEY_SEED) | 1n;
+        this.state = mixed & ((1n << 32n) - 1n);
+      }
+      next() {
+        this.state ^= this.state << 7n;
+        this.state ^= this.state >> 9n;
+        this.state ^= this.state << 8n;
+        this.state &= (1n << 32n) - 1n;
+        return this.state;
+      }
+      nextByte() {
+        return Number(this.next() & 0xffn);
+      }
     }
 
     class BitWriter {
@@ -193,6 +213,21 @@ return c</textarea>
     function clampImm10(n) {
       const clamped = Math.max(-512, Math.min(511, Number(n)));
       return clamped & 0x3ff;
+    }
+
+    function crc32(bytes) {
+      const table = (() => {
+        const t = new Uint32Array(256);
+        for (let i = 0; i < 256; i++) {
+          let c = i;
+          for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+          t[i] = c >>> 0;
+        }
+        return t;
+      })();
+      let crc = 0 ^ -1;
+      for (const b of bytes) crc = (crc >>> 8) ^ table[(crc ^ b) & 0xff];
+      return (crc ^ -1) >>> 0;
     }
 
     function parseLines(input) {
@@ -267,7 +302,11 @@ return c</textarea>
           }
         }
       }
-      return { ...writer.finalize(), map };
+      const { bytes, bits } = writer.finalize();
+      const key = BigInt(crypto.getRandomValues(new Uint32Array(1))[0]);
+      const stream = new XorShift64(key);
+      const cipher = bytes.map((b) => b ^ stream.nextByte());
+      return { bytes: cipher, bits, map, key, crc: crc32(cipher) };
     }
 
     function toHex(bytes) {
@@ -282,9 +321,11 @@ return c</textarea>
 
     function compileUI() {
       const instructions = parseLines(document.getElementById("source").value);
-      const { bytes, bits, map } = encode(instructions);
+      const { bytes, bits, map, key, crc } = encode(instructions);
       document.getElementById("hex").textContent = toHex(bytes);
       document.getElementById("bitStats").textContent = `${bits} bits · ${bytes.length} bytes`;
+      document.getElementById("keyView").textContent = `Key: 0x${key.toString(16).padStart(8, "0")}`;
+      document.getElementById("crcView").textContent = `CRC32: 0x${crc.toString(16).padStart(8, "0")}`;
       renderOpcodes(map);
     }
 
@@ -305,8 +346,49 @@ local function sign10(v)
   return bit32.band(v,0x200) ~= 0 and (v - 0x400) or v
 end
 
-local function run(stream)
-  local state = {stream=stream, byte_index=1, bit_index=0}
+local function keystream(seed)
+  local state = bit32.bor(bit32.bxor(seed, 0x51234567), 1)
+  return function()
+    state = bit32.band(state ~ (state << 7), 0xffffffff)
+    state = bit32.band(state ~ bit32.rshift(state, 9), 0xffffffff)
+    state = bit32.band(state ~ (state << 8), 0xffffffff)
+    return bit32.band(state, 0xff)
+  end
+end
+
+local function decrypt(stream, seed)
+  local ks = keystream(seed)
+  local out = {}
+  for i=1,#stream do out[i] = bit32.bxor(stream[i], ks()) end
+  return out
+end
+
+local function crc32(bytes)
+  local poly = 0xEDB88320
+  local table = {}
+  for i=0,255 do
+    local c = i
+    for _=1,8 do
+      if bit32.band(c,1) == 1 then c = bit32.bxor(poly, bit32.rshift(c,1))
+      else c = bit32.rshift(c,1) end
+    end
+    table[i] = c
+  end
+  local crc = bit32.bnot(0)
+  for i=1,#bytes do
+    local idx = bit32.band(bit32.bxor(crc, bytes[i]), 0xff)
+    crc = bit32.bxor(table[idx], bit32.rshift(crc,8))
+  end
+  return bit32.bnot(crc) % 0x100000000
+end
+
+local function run(stream, seed, expected_crc)
+  local actual_crc = crc32(stream)
+  if expected_crc and actual_crc ~= expected_crc then
+    error(string.format("CRC mismatch: got 0x%08X expected 0x%08X", actual_crc, expected_crc))
+  end
+  local plain = decrypt(stream, seed)
+  local state = {stream=plain, byte_index=1, bit_index=0}
   local mapping = {}
   local count = read_bits(state,6)
   for i=1,count do mapping[read_bits(state,6)] = ORDER[i] end
