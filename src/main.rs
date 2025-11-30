@@ -12,6 +12,7 @@ mod vm;
 const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
 const PLATOBOOST_PROJECT: &str = "3035";
 const PLATOBOOST_SECRET: &str = "e787153b-65f0-4a2a-b209-7bf2ddf2b8bc";
+const DISCORD_TOKEN: &str = "boy here";
 
 #[derive(Clone, Debug)]
 struct Session {
@@ -44,9 +45,7 @@ pub enum ProtectionLevel {
 }
 
 type Sessions = Arc<DashMap<u64, Session>>;
-
 type ProcessingQueueSender = mpsc::Sender<WorkItem>;
-
 type ProcessingQueueReceiver = mpsc::Receiver<WorkItem>;
 
 #[derive(Clone)]
@@ -82,12 +81,16 @@ async fn verify_key(client: &Client, key: &str) -> anyhow::Result<bool> {
         "https://api.platoboost.com/v1/public/verify?public_key={}&key={}",
         PLATOBOOST_PROJECT, key
     );
-    let resp = client.get(url).send().await?.error_for_status()?;
+    let resp = client
+        .get(url)
+        .header("x-plato-secret", PLATOBOOST_SECRET)
+        .send()
+        .await?
+        .error_for_status()?;
     let parsed: PlatoboostResponse = resp.json().await?;
     Ok(parsed.valid)
 }
 
-/// Background worker consuming the queue and dispatching encrypted payloads.
 async fn start_consumer(mut rx: ProcessingQueueReceiver, bot: BotData) {
     while let Some(item) = rx.recv().await {
         let bot_clone = bot.clone();
@@ -127,110 +130,108 @@ async fn start_consumer(mut rx: ProcessingQueueReceiver, bot: BotData) {
     }
 }
 
-/// Slash command: /help
 #[poise::command(slash_command)]
 async fn help(ctx: poise::Context<'_, BotData, anyhow::Error>) -> Result<(), anyhow::Error> {
-    let response = "Upload a Lua/Luau file (<5MB), pick an option (Default/Heavy/Light), then retrieve the Platoboost key from the link we send. Provide it with /key <KEY> to start encryption.";
-    ctx.say(response).await?;
-    Ok(())
-}
-
-/// Slash command: /upload
-#[poise::command(slash_command)]
-async fn upload(
-    ctx: poise::Context<'_, BotData, anyhow::Error>,
-    #[description = "Lua/Luau script attachment"] attachment: serenity::Attachment,
-) -> Result<(), anyhow::Error> {
-    if attachment.size > MAX_FILE_SIZE as i32 {
-        ctx.say("File too large. Please keep under 5MB.").await?;
+    if ctx.guild_id().is_some() {
+        ctx.send(
+            poise::CreateReply::default()
+                .content("هذا البوت يعمل عبر الخاص فقط. ارسل ملف Lua/Luau ليبدأ التشفير.")
+                .ephemeral(true),
+        )
+        .await?;
         return Ok(());
     }
 
-    let http_client = &ctx.data().http_client;
-    let bytes = http_client
-        .get(attachment.url.clone())
+    ctx.say("أرسل ملف Lua/Luau (أقل من 5MB) في الخاص. سأعيد تعيين الجلسة، أطلب منك اختيار مستوى التشفير، ثم أعطيك رابط Platoboost لتحصل على المفتاح وبعدها أكتب key <المفتاح> هنا.")
+        .await?;
+    Ok(())
+}
+
+async fn handle_dm_attachment(
+    msg: &serenity::Message,
+    ctx: &serenity::Context,
+    data: &BotData,
+) -> anyhow::Result<()> {
+    if msg.attachments.is_empty() {
+        return Ok(());
+    }
+
+    let attachment = &msg.attachments[0];
+    if attachment.size > MAX_FILE_SIZE as i32 {
+        msg.channel_id
+            .say(&ctx.http, "❌ الملف أكبر من 5MB. أعد المحاولة بملف أصغر.")
+            .await?;
+        return Ok(());
+    }
+
+    let bytes = data
+        .http_client
+        .get(&attachment.url)
         .send()
         .await?
         .bytes()
         .await?;
 
-    let user_id = ctx.author().id.0;
-    let mut entry = ctx
-        .data()
+    let mut entry = data
         .sessions
-        .entry(user_id)
+        .entry(msg.author.id.0)
         .or_insert_with(Session::new);
     entry.reset_for_new_request();
     entry.file_bytes = Some(bytes.to_vec());
 
-    ctx.say(
-        "File received. Choose encryption option: Default, Heavy, or Light using /option <level>.",
-    )
-    .await?;
+    let components = serenity::CreateActionRow::Buttons(vec![
+        serenity::CreateButton::new("opt_default")
+            .style(serenity::ButtonStyle::Success)
+            .label("Default (Green)")
+            .emoji('🛡'),
+        serenity::CreateButton::new("opt_heavy")
+            .style(serenity::ButtonStyle::Success)
+            .label("Heavy (Green)")
+            .emoji('🔥'),
+        serenity::CreateButton::new("opt_light")
+            .style(serenity::ButtonStyle::Success)
+            .label("Light (Green)")
+            .emoji('⚡'),
+    ]);
+
+    msg.channel_id
+        .send_message(&ctx.http, |m| {
+            m.content(
+                "📥 تم استلام الملف. اختر نوع التشفير (الأزرار باللون الأخضر تدل على أنها نشطة):",
+            )
+            .components(|c| c.add_action_row(components))
+        })
+        .await?;
     Ok(())
 }
 
-/// Slash command: /option
-#[poise::command(slash_command)]
-async fn option(
-    ctx: poise::Context<'_, BotData, anyhow::Error>,
-    #[description = "Protection level"] level: String,
-) -> Result<(), anyhow::Error> {
-    let level_norm = level.to_lowercase();
-    let option = match level_norm.as_str() {
-        "default" => ProtectionLevel::Default,
-        "heavy" => ProtectionLevel::Heavy,
-        "light" => ProtectionLevel::Light,
-        _ => {
-            ctx.say("Unknown option. Use Default, Heavy, or Light.")
-                .await?;
-            return Ok(());
-        }
-    };
-
-    let user_id = ctx.author().id.0;
-    let mut entry = ctx
-        .data()
-        .sessions
-        .entry(user_id)
-        .or_insert_with(Session::new);
-    entry.option = Some(option);
-    entry.verified = false;
-
-    let link = platoboost_link(user_id);
-    ctx.say(format!(
-        "Option set to {:?}. Retrieve your key here: {}. Then run /key <KEY>.",
-        option, link
-    ))
-    .await?;
-    Ok(())
-}
-
-/// Slash command: /key
-#[poise::command(slash_command)]
-async fn key(
-    ctx: poise::Context<'_, BotData, anyhow::Error>,
-    #[description = "Platoboost key"] key: String,
-) -> Result<(), anyhow::Error> {
-    let user_id = ctx.author().id.0;
-    let Some(mut session) = ctx.data().sessions.get_mut(&user_id) else {
-        ctx.say("No active session. Upload a file first with /upload.")
+async fn handle_key_submission(
+    msg: &serenity::Message,
+    ctx: &serenity::Context,
+    data: &BotData,
+    key: &str,
+) -> anyhow::Result<()> {
+    let user_id = msg.author.id.0;
+    let Some(mut session) = data.sessions.get_mut(&user_id) else {
+        msg.channel_id
+            .say(&ctx.http, "❌ لا توجد جلسة. أرسل ملفاً أولاً.")
             .await?;
         return Ok(());
     };
 
-    let valid = verify_key(&ctx.data().http_client, &key).await?;
+    let valid = verify_key(&data.http_client, key).await?;
     if !valid {
-        ctx.say("Invalid key. Please try again from the Platoboost link.")
+        msg.channel_id
+            .say(&ctx.http, "❌ مفتاح غير صالح من Platoboost. حاول مجدداً.")
             .await?;
         session.verified = false;
         return Ok(());
     }
 
     session.verified = true;
-
     if session.file_bytes.is_none() || session.option.is_none() {
-        ctx.say("Missing file or option. Please upload and select option before submitting key.")
+        msg.channel_id
+            .say(&ctx.http, "⚠️ ناقص خيار التشفير أو الملف. أعد الإرسال.")
             .await?;
         session.verified = false;
         return Ok(());
@@ -238,14 +239,88 @@ async fn key(
 
     let work = WorkItem {
         user_id,
-        channel_id: ctx.channel_id(),
+        channel_id: msg.channel_id,
         option: session.option.unwrap(),
         file_bytes: session.file_bytes.clone().unwrap(),
     };
-
-    ctx.data().queue.send(work).await.ok();
-    ctx.say("Key verified. Job queued for encryption. You'll receive output shortly.")
+    let _ = data.queue.send(work).await;
+    msg.channel_id
+        .say(
+            &ctx.http,
+            "🔑 مفتاح صحيح. المهمة أُضيفت إلى قائمة المعالجة المتقدمة.",
+        )
         .await?;
+    Ok(())
+}
+
+async fn event_handler(
+    ctx: &serenity::Context,
+    event: &serenity::FullEvent,
+    _framework: poise::FrameworkContext<'_, BotData, anyhow::Error>,
+    data: &BotData,
+) -> Result<(), anyhow::Error> {
+    match event {
+        serenity::FullEvent::Message { new_message } => {
+            if new_message.author.bot {
+                return Ok(());
+            }
+            if !new_message.is_private() {
+                return Ok(());
+            }
+            if !new_message.attachments.is_empty() {
+                handle_dm_attachment(new_message, ctx, data).await?;
+                return Ok(());
+            }
+            let content = new_message.content.trim();
+            if let Some(stripped) = content.strip_prefix("key ") {
+                handle_key_submission(new_message, ctx, data, stripped.trim()).await?;
+            } else if let Some(stripped) = content.strip_prefix("/key ") {
+                handle_key_submission(new_message, ctx, data, stripped.trim()).await?;
+            }
+        }
+        serenity::FullEvent::InteractionCreate { interaction } => {
+            if let serenity::Interaction::MessageComponent(component) = interaction {
+                if !component.user.bot {
+                    let custom_id = component.data.custom_id.as_str();
+                    let option = match custom_id {
+                        "opt_default" => Some(ProtectionLevel::Default),
+                        "opt_heavy" => Some(ProtectionLevel::Heavy),
+                        "opt_light" => Some(ProtectionLevel::Light),
+                        _ => None,
+                    };
+                    if let Some(opt) = option {
+                        let mut entry = data
+                            .sessions
+                            .entry(*component.user.id.as_u64())
+                            .or_insert_with(Session::new);
+                        entry.option = Some(opt);
+                        entry.verified = false;
+                        let link = platoboost_link(*component.user.id.as_u64());
+                        component
+                            .create_interaction_response(&ctx.http, |r| {
+                                r.kind(serenity::InteractionResponseType::ChannelMessageWithSource)
+                                    .interaction_response_data(|d| {
+                                        d.content(format!(
+                                            "✅ تم اختيار {:?}. احصل على مفتاحك: {} ثم أرسل \"key <المفتاح>\" هنا.",
+                                            opt, link
+                                        ))
+                                        .ephemeral(true)
+                                    })
+                            })
+                            .await
+                            .ok();
+                    }
+                }
+            }
+        }
+        serenity::FullEvent::Ready { .. } => {
+            tracing::info!("DRK V3 bot ready with Platoboost guard");
+        }
+        serenity::FullEvent::DispatchError { error, event, .. } => {
+            tracing::warn!(?error, ?event, "dispatch error");
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -253,17 +328,22 @@ async fn key(
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt::init();
     let sessions: Sessions = Arc::new(DashMap::new());
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = mpsc::channel(128);
     let http_client = Client::builder().user_agent("drk-v3-bot").build()?;
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![help(), upload(), option(), key()],
+            commands: vec![help()],
+            event_handler: |ctx, event, framework, data| {
+                Box::pin(event_handler(ctx, event, framework, data))
+            },
             ..Default::default()
         })
-        .token(std::env::var("DISCORD_TOKEN")?)
+        .token(DISCORD_TOKEN)
         .intents(
-            serenity::GatewayIntents::non_privileged() | serenity::GatewayIntents::MESSAGE_CONTENT,
+            serenity::GatewayIntents::GUILDS
+                | serenity::GatewayIntents::DIRECT_MESSAGES
+                | serenity::GatewayIntents::MESSAGE_CONTENT,
         )
         .setup(move |ctx, _ready, framework| {
             let data = BotData {

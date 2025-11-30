@@ -36,11 +36,23 @@ pub fn assemble_loader(payload: &ProtectedPayload) -> String {
         r#"local json = require('game'):Service('HttpService')
 local bit = bit32
 local function anti_tamper()
+    local function bail()
+        while true do end
+    end
     local ok, info = pcall(debug.info, 1, 's')
     if ok and info then
         if tostring(info):find('HttpService') or getfenv then
-            while true do end
+            bail()
         end
+    end
+    if debug and debug.sethook then
+        local ok_set = pcall(debug.sethook, function() bail() end, "crl")
+        if ok_set then
+            bail()
+        end
+    end
+    if (getgenv and getgenv().hookfunction) or (hookfunction ~= nil) then
+        bail()
     end
 end
 anti_tamper()
