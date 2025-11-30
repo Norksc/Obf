@@ -142,6 +142,7 @@ return c</textarea>
     <section>
       <h2>Binary Output</h2>
       <div class="pill" id="bitStats">0 bits · 0 bytes</div>
+      <div class="pill" id="optStats">IR: 0 → 0 stmts (DCE/Folded)</div>
       <div class="pill" id="keyView">Key: n/a</div>
       <div class="pill" id="crcView">CRC32: n/a</div>
       <pre class="output" id="hex"></pre>
@@ -232,45 +233,132 @@ return c</textarea>
 
     function parseLines(input) {
       const lines = input.split(/\n|;/).map(l => l.trim()).filter(Boolean);
-      const symbols = new Map();
-      let nextReg = 0;
-      const ensureReg = (name) => {
-        if (symbols.has(name)) return symbols.get(name);
-        symbols.set(name, nextReg);
-        return nextReg++;
-      };
-      const parseOperand = (token) => {
-        const num = Number(token);
-        return Number.isFinite(num) && token.match(/^[-+]?\d+(\.\d+)?$/)
+      const stmts = [];
+      const parseExpr = (expr) => {
+        const match = expr.match(/(.+)([+\-*\/])(.+)/);
+        if (match) {
+          return {
+            kind: "bin",
+            op: {"+":"Add","-":"Sub","*":"Mul","/":"Div"}[match[2]],
+            lhs: parseExpr(match[1].trim()),
+            rhs: parseExpr(match[3].trim()),
+          };
+        }
+        const num = Number(expr);
+        return Number.isFinite(num) && expr.match(/^[-+]?\d+(\.\d+)?$/)
           ? { kind: "imm", value: num }
-          : { kind: "reg", value: ensureReg(token) };
+          : { kind: "var", name: expr };
       };
 
-      const instructions = [];
       for (const line of lines) {
         if (line.startsWith("return ")) {
-          const reg = ensureReg(line.replace("return", "").trim());
-          instructions.push({ op: "Return", dst: reg });
+          stmts.push({ kind: "return", name: line.replace("return", "").trim() });
           continue;
         }
-        if (line === "halt") { instructions.push({ op: "Halt" }); continue; }
+        if (line === "halt") { stmts.push({ kind: "halt" }); continue; }
         const [lhs, rhs] = line.split("=").map(s => s.trim());
-        const dst = ensureReg(lhs);
         if (!rhs) continue;
-        const match = rhs.match(/(.+)([+\-*\/])(.+)/);
-        if (match) {
-          const a = parseOperand(match[1].trim());
-          const b = parseOperand(match[3].trim());
-          const opSym = match[2];
-          const op = {"+":"Add","-":"Sub","*":"Mul","/":"Div"}[opSym];
-          instructions.push({ op, dst, a, b });
+        stmts.push({ kind: "assign", name: lhs.replace(/^local\s+/, ""), expr: parseExpr(rhs) });
+      }
+      stmts.push({ kind: "halt" });
+      return stmts;
+    }
+
+    function constantFold(expr) {
+      if (expr.kind !== "bin") return expr;
+      const lhs = constantFold(expr.lhs);
+      const rhs = constantFold(expr.rhs);
+      if (lhs.kind === "imm" && rhs.kind === "imm") {
+        const { op } = expr;
+        const value = {
+          Add: lhs.value + rhs.value,
+          Sub: lhs.value - rhs.value,
+          Mul: lhs.value * rhs.value,
+          Div: lhs.value / rhs.value,
+        }[op];
+        return { kind: "imm", value };
+      }
+      return { ...expr, lhs, rhs };
+    }
+
+    function collectUses(expr, uses) {
+      if (expr.kind === "var") uses.add(expr.name);
+      if (expr.kind === "bin") { collectUses(expr.lhs, uses); collectUses(expr.rhs, uses); }
+    }
+
+    function deadCodeEliminate(stmts) {
+      const needed = new Set();
+      const out = [];
+      for (let i = stmts.length - 1; i >= 0; i--) {
+        const stmt = stmts[i];
+        if (stmt.kind === "return") { needed.add(stmt.name); out.push(stmt); continue; }
+        if (stmt.kind === "assign") {
+          if (needed.has(stmt.name)) {
+            const uses = new Set();
+            collectUses(stmt.expr, uses);
+            needed.delete(stmt.name);
+            uses.forEach(u => needed.add(u));
+            out.push(stmt);
+          }
           continue;
         }
-        const operand = parseOperand(rhs);
-        if (operand.kind === "imm") instructions.push({ op: "LoadK", dst, imm: operand.value });
-        else instructions.push({ op: "Move", dst, src: operand.value });
+        if (stmt.kind === "halt") out.push(stmt);
       }
-      instructions.push({ op: "Halt" });
+      return out.reverse();
+    }
+
+    function lower(stmts) {
+      const instructions = [];
+      const symbols = new Map();
+      const constPool = new Map();
+      let nextReg = 0;
+      const alloc = () => {
+        if (nextReg >= 32) throw new Error("register pressure exceeded");
+        return nextReg++;
+      };
+      const ensureVar = (name) => {
+        if (symbols.has(name)) return symbols.get(name);
+        const r = alloc();
+        symbols.set(name, r);
+        return r;
+      };
+      const ensureConst = (imm) => {
+        if (constPool.has(imm)) return constPool.get(imm);
+        const r = alloc();
+        constPool.set(imm, r);
+        instructions.push({ op: "LoadK", dst: r, imm });
+        return r;
+      };
+      const lowerExpr = (expr, target) => {
+        if (expr.kind === "imm") { instructions.push({ op: "LoadK", dst: target, imm: expr.value }); return; }
+        if (expr.kind === "var") {
+          const src = symbols.get(expr.name);
+          if (src === undefined) throw new Error(`use of undefined symbol ${expr.name}`);
+          if (src !== target) instructions.push({ op: "Move", dst: target, src });
+          return;
+        }
+        const ra = expr.lhs.kind === "imm" ? ensureConst(expr.lhs.value)
+              : expr.lhs.kind === "var" ? symbols.get(expr.lhs.name)
+              : (() => { const r = alloc(); lowerExpr(expr.lhs, r); return r; })();
+        const rb = expr.rhs.kind === "imm" ? { imm: expr.rhs.value }
+              : expr.rhs.kind === "var" ? { reg: symbols.get(expr.rhs.name) }
+              : (() => { const r = alloc(); lowerExpr(expr.rhs, r); return { reg: r }; })();
+        instructions.push({ op: expr.op, dst: target, a: ra, b: rb });
+      };
+
+      for (const stmt of stmts) {
+        if (stmt.kind === "assign") {
+          const expr = constantFold(stmt.expr);
+          const dst = ensureVar(stmt.name);
+          lowerExpr(expr, dst);
+        } else if (stmt.kind === "return") {
+          const src = symbols.get(stmt.name);
+          if (src === undefined) throw new Error(`use of undefined symbol ${stmt.name}`);
+          instructions.push({ op: "Return", dst: src });
+        } else if (stmt.kind === "halt") {
+          instructions.push({ op: "Halt" });
+        }
+      }
       return instructions;
     }
 
@@ -296,9 +384,9 @@ return c</textarea>
           case "Return": emit(0, instr.dst ?? instr.src, 0, 0, 5); break;
           case "Halt": emit(0, 0, 0, 0, 5); break;
           default: {
-            const ra = instr.a.kind === "reg" ? instr.a.value : 0;
-            if (instr.b.kind === "reg") emit(0, instr.dst, ra, instr.b.value, 5);
-            else emit(1, instr.dst, ra, clampImm10(instr.b.value), 10);
+            const ra = instr.a;
+            if (instr.b.reg !== undefined) emit(0, instr.dst, ra, instr.b.reg, 5);
+            else emit(1, instr.dst, ra, clampImm10(instr.b.imm), 10);
           }
         }
       }
@@ -320,8 +408,11 @@ return c</textarea>
     }
 
     function compileUI() {
-      const instructions = parseLines(document.getElementById("source").value);
+      const parsed = parseLines(document.getElementById("source").value);
+      const optimized = deadCodeEliminate(parsed);
+      const instructions = lower(optimized);
       const { bytes, bits, map, key, crc } = encode(instructions);
+      document.getElementById("optStats").textContent = `IR: ${parsed.length} → ${instructions.length} stmts (DCE/Folded)`;
       document.getElementById("hex").textContent = toHex(bytes);
       document.getElementById("bitStats").textContent = `${bits} bits · ${bytes.length} bytes`;
       document.getElementById("keyView").textContent = `Key: 0x${key.toString(16).padStart(8, "0")}`;

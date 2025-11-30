@@ -1,7 +1,7 @@
 use crc32fast::Hasher as Crc32;
 use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Read};
@@ -58,6 +58,24 @@ impl DynamicOpcodeMap {
     }
 }
 
+#[derive(Debug, Clone)]
+enum Expr {
+    Imm(i32),
+    Var(String),
+    Bin {
+        op: OpCode,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum Stmt {
+    Assign { name: String, expr: Expr },
+    Return(String),
+    Halt,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Operand {
     Reg(u8),
@@ -87,117 +105,62 @@ enum InstrKind {
 }
 
 #[derive(Default)]
-struct Parser {
-    symbols: HashMap<String, u8>,
-    next_reg: u8,
-}
+struct Parser;
 
 impl Parser {
     fn new() -> Self {
         Self::default()
     }
 
-    fn ensure_reg(&mut self, name: &str) -> Result<u8, Box<dyn Error>> {
-        if let Some(&reg) = self.symbols.get(name) {
-            Ok(reg)
-        } else {
-            if self.next_reg >= MAX_REGS {
-                return Err(format!(
-                    "register limit ({MAX_REGS}) exceeded while allocating '{name}'"
-                )
-                .into());
-            }
-            let reg = self.next_reg;
-            self.next_reg += 1;
-            self.symbols.insert(name.to_string(), reg);
-            Ok(reg)
-        }
-    }
-
-    fn ensure_reg_with_new(&mut self, name: &str) -> Result<(u8, bool), Box<dyn Error>> {
-        if let Some(&reg) = self.symbols.get(name) {
-            Ok((reg, false))
-        } else {
-            if self.next_reg >= MAX_REGS {
-                return Err(format!(
-                    "register limit ({MAX_REGS}) exceeded while allocating '{name}'"
-                )
-                .into());
-            }
-            let reg = self.next_reg;
-            self.next_reg += 1;
-            self.symbols.insert(name.to_string(), reg);
-            Ok((reg, true))
-        }
-    }
-
-    fn parse_operand(&mut self, token: &str) -> Result<Operand, Box<dyn Error>> {
+    fn parse_operand(token: &str) -> Result<Expr, Box<dyn Error>> {
         if let Ok(num) = token.parse::<i32>() {
-            Ok(Operand::Imm(num))
+            Ok(Expr::Imm(num))
         } else {
-            Ok(Operand::Reg(self.ensure_reg(token)?))
+            Ok(Expr::Var(token.trim().to_string()))
         }
     }
 
-    fn parse_line(&mut self, line: &str) -> Result<Vec<InstrKind>, Box<dyn Error>> {
+    fn parse_expr(expr: &str) -> Result<Expr, Box<dyn Error>> {
+        if let Some((lhs, op, rhs)) = Self::split_binary(expr) {
+            let lhs_expr = Self::parse_operand(lhs)?;
+            let rhs_expr = Self::parse_operand(rhs)?;
+            let op = match op {
+                "+" => OpCode::Add,
+                "-" => OpCode::Sub,
+                "*" => OpCode::Mul,
+                "/" => OpCode::Div,
+                _ => return Err("unsupported binary op".into()),
+            };
+            Ok(Expr::Bin {
+                op,
+                lhs: Box::new(lhs_expr),
+                rhs: Box::new(rhs_expr),
+            })
+        } else {
+            Self::parse_operand(expr)
+        }
+    }
+
+    fn parse_line(line: &str) -> Result<Option<Stmt>, Box<dyn Error>> {
         let trimmed = line.trim();
-        let mut out = Vec::new();
         if trimmed.is_empty() {
-            return Ok(out);
+            return Ok(None);
         }
         if trimmed.starts_with("return ") {
             let name = trimmed.strip_prefix("return ").unwrap().trim();
-            let reg = self.ensure_reg(name)?;
-            out.push(InstrKind::Return { src: reg });
-            return Ok(out);
+            return Ok(Some(Stmt::Return(name.to_string())));
         }
         if trimmed == "halt" {
-            out.push(InstrKind::Halt);
-            return Ok(out);
+            return Ok(Some(Stmt::Halt));
         }
 
         if let Some((lhs, rhs)) = trimmed.split_once('=') {
             let lhs_clean = lhs.trim().trim_start_matches("local ").trim();
-            let dest = self.ensure_reg(lhs_clean)?;
-            let expr = rhs.trim();
-            if let Some((a, op_sym, b)) = Self::split_binary(expr) {
-                let a_operand = self.parse_operand(a)?;
-                let b_operand = self.parse_operand(b)?;
-                let a_reg = match a_operand {
-                    Operand::Reg(r) => r,
-                    Operand::Imm(val) => {
-                        let (reg, is_new) =
-                            self.ensure_reg_with_new(&format!("__const_lhs_{}", val))?;
-                        if is_new {
-                            out.push(InstrKind::LoadK { dst: reg, imm: val });
-                        }
-                        reg
-                    }
-                };
-                let op = match op_sym {
-                    "+" => OpCode::Add,
-                    "-" => OpCode::Sub,
-                    "*" => OpCode::Mul,
-                    "/" => OpCode::Div,
-                    _ => return Err("unsupported binary op".into()),
-                };
-                out.push(InstrKind::Bin {
-                    op,
-                    dst: dest,
-                    a: a_reg,
-                    b: b_operand,
-                });
-                return Ok(out);
-            }
-            let operand = self.parse_operand(expr)?;
-            match operand {
-                Operand::Imm(val) => out.push(InstrKind::LoadK {
-                    dst: dest,
-                    imm: val,
-                }),
-                Operand::Reg(src) => out.push(InstrKind::Move { dst: dest, src }),
-            }
-            return Ok(out);
+            let expr = Self::parse_expr(rhs.trim())?;
+            return Ok(Some(Stmt::Assign {
+                name: lhs_clean.to_string(),
+                expr,
+            }));
         }
 
         Err(format!("Unable to parse line: {trimmed}").into())
@@ -212,13 +175,15 @@ impl Parser {
         None
     }
 
-    fn parse_program(&mut self, input: &str) -> Result<Vec<InstrKind>, Box<dyn Error>> {
-        let mut instructions = Vec::new();
+    fn parse_program(&mut self, input: &str) -> Result<Vec<Stmt>, Box<dyn Error>> {
+        let mut stmts = Vec::new();
         for line in input.lines() {
-            instructions.extend(self.parse_line(line)?);
+            if let Some(stmt) = Self::parse_line(line)? {
+                stmts.push(stmt);
+            }
         }
-        instructions.push(InstrKind::Halt);
-        Ok(instructions)
+        stmts.push(Stmt::Halt);
+        Ok(stmts)
     }
 }
 
@@ -227,6 +192,201 @@ struct BitWriter {
     acc: u8,
     used: u8,
     total_bits: usize,
+}
+
+fn constant_fold(expr: Expr) -> Expr {
+    match expr {
+        Expr::Bin { op, lhs, rhs } => {
+            let lhs_f = constant_fold(*lhs);
+            let rhs_f = constant_fold(*rhs);
+            match (lhs_f.clone(), rhs_f.clone()) {
+                (Expr::Imm(a), Expr::Imm(b)) => {
+                    let val = match op {
+                        OpCode::Add => a + b,
+                        OpCode::Sub => a - b,
+                        OpCode::Mul => a * b,
+                        OpCode::Div => a / b,
+                        _ => unreachable!(),
+                    };
+                    Expr::Imm(val)
+                }
+                _ => Expr::Bin {
+                    op,
+                    lhs: Box::new(lhs_f),
+                    rhs: Box::new(rhs_f),
+                },
+            }
+        }
+        other => other,
+    }
+}
+
+fn collect_uses(expr: &Expr, uses: &mut HashSet<String>) {
+    match expr {
+        Expr::Var(name) => {
+            uses.insert(name.clone());
+        }
+        Expr::Bin { lhs, rhs, .. } => {
+            collect_uses(lhs, uses);
+            collect_uses(rhs, uses);
+        }
+        Expr::Imm(_) => {}
+    }
+}
+
+fn dead_code_eliminate(stmts: Vec<Stmt>) -> Vec<Stmt> {
+    let mut needed: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for stmt in stmts.into_iter().rev() {
+        match stmt {
+            Stmt::Return(name) => {
+                needed.insert(name.clone());
+                out.push(Stmt::Return(name));
+            }
+            Stmt::Assign { name, expr } => {
+                if needed.contains(&name) {
+                    let mut uses = HashSet::new();
+                    collect_uses(&expr, &mut uses);
+                    needed.remove(&name);
+                    needed.extend(uses);
+                    out.push(Stmt::Assign { name, expr });
+                }
+            }
+            Stmt::Halt => out.push(Stmt::Halt),
+        }
+    }
+    out.reverse();
+    out
+}
+
+#[derive(Default)]
+struct LowerCtx {
+    symbols: HashMap<String, u8>,
+    const_pool: HashMap<i32, u8>,
+    next_reg: u8,
+}
+
+impl LowerCtx {
+    fn alloc_reg(&mut self) -> Result<u8, Box<dyn Error>> {
+        if self.next_reg >= MAX_REGS {
+            return Err(format!("register limit ({MAX_REGS}) exceeded").into());
+        }
+        let reg = self.next_reg;
+        self.next_reg += 1;
+        Ok(reg)
+    }
+
+    fn ensure_var(&mut self, name: &str) -> Result<u8, Box<dyn Error>> {
+        if let Some(&reg) = self.symbols.get(name) {
+            Ok(reg)
+        } else {
+            let reg = self.alloc_reg()?;
+            self.symbols.insert(name.to_string(), reg);
+            Ok(reg)
+        }
+    }
+
+    fn ensure_const(
+        &mut self,
+        imm: i32,
+        instructions: &mut Vec<InstrKind>,
+    ) -> Result<u8, Box<dyn Error>> {
+        if let Some(&reg) = self.const_pool.get(&imm) {
+            return Ok(reg);
+        }
+        let reg = self.alloc_reg()?;
+        self.const_pool.insert(imm, reg);
+        instructions.push(InstrKind::LoadK { dst: reg, imm });
+        Ok(reg)
+    }
+}
+
+fn lower_expr(
+    expr: Expr,
+    target: u8,
+    ctx: &mut LowerCtx,
+    instructions: &mut Vec<InstrKind>,
+) -> Result<(), Box<dyn Error>> {
+    match expr {
+        Expr::Imm(v) => {
+            instructions.push(InstrKind::LoadK {
+                dst: target,
+                imm: v,
+            });
+        }
+        Expr::Var(name) => {
+            let src = ctx
+                .symbols
+                .get(&name)
+                .copied()
+                .ok_or_else(|| format!("use of undefined symbol '{name}'"))?;
+            if src != target {
+                instructions.push(InstrKind::Move { dst: target, src });
+            }
+        }
+        Expr::Bin { op, lhs, rhs } => {
+            let a_reg = match *lhs {
+                Expr::Imm(v) => ctx.ensure_const(v, instructions)?,
+                Expr::Var(name) => ctx
+                    .symbols
+                    .get(&name)
+                    .copied()
+                    .ok_or_else(|| format!("use of undefined symbol '{name}'"))?,
+                Expr::Bin { .. } => {
+                    let reg = ctx.alloc_reg()?;
+                    lower_expr(*lhs, reg, ctx, instructions)?;
+                    reg
+                }
+            };
+            let b_operand = match *rhs {
+                Expr::Imm(v) => Operand::Imm(v),
+                Expr::Var(name) => {
+                    let reg = ctx
+                        .symbols
+                        .get(&name)
+                        .copied()
+                        .ok_or_else(|| format!("use of undefined symbol '{name}'"))?;
+                    Operand::Reg(reg)
+                }
+                Expr::Bin { .. } => {
+                    let reg = ctx.alloc_reg()?;
+                    lower_expr(*rhs, reg, ctx, instructions)?;
+                    Operand::Reg(reg)
+                }
+            };
+            instructions.push(InstrKind::Bin {
+                op,
+                dst: target,
+                a: a_reg,
+                b: b_operand,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn lower_program(stmts: Vec<Stmt>) -> Result<Vec<InstrKind>, Box<dyn Error>> {
+    let mut instructions = Vec::new();
+    let mut ctx = LowerCtx::default();
+    for stmt in stmts {
+        match stmt {
+            Stmt::Assign { name, expr } => {
+                let expr = constant_fold(expr);
+                let dst = ctx.ensure_var(&name)?;
+                lower_expr(expr, dst, &mut ctx, &mut instructions)?;
+            }
+            Stmt::Return(name) => {
+                let src = ctx
+                    .symbols
+                    .get(&name)
+                    .copied()
+                    .ok_or_else(|| format!("use of undefined symbol '{name}'"))?;
+                instructions.push(InstrKind::Return { src });
+            }
+            Stmt::Halt => instructions.push(InstrKind::Halt),
+        }
+    }
+    Ok(instructions)
 }
 
 impl BitWriter {
@@ -410,7 +570,16 @@ fn obfuscate_program(encoded: EncodedProgram, seed: u32) -> CipheredProgram {
 
 fn compile(input: &str, seed: u32) -> Result<(CipheredProgram, DynamicOpcodeMap), Box<dyn Error>> {
     let mut parser = Parser::new();
-    let program = parser.parse_program(input)?;
+    let ast = parser.parse_program(input)?;
+    let ast = ast.into_iter().map(|s| match s {
+        Stmt::Assign { name, expr } => Stmt::Assign {
+            name,
+            expr: constant_fold(expr),
+        },
+        other => other,
+    });
+    let ast = dead_code_eliminate(ast.collect());
+    let program = lower_program(ast)?;
     let mapping = DynamicOpcodeMap::new(seed);
     let encoded = encode_program(&program, &mapping)?;
     let ciphered = obfuscate_program(encoded, seed);
