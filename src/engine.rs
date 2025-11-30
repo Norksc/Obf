@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use aes_gcm::{aead::Aead, aead::KeyInit, Aes256Gcm, Nonce};
 use base64::{engine::general_purpose, Engine as _};
+use hex::ToHex;
 use rand::rngs::{OsRng, StdRng};
 use rand::seq::SliceRandom;
 use rand::{RngCore, SeedableRng};
@@ -44,6 +45,7 @@ pub struct Bytecode {
     pub code: Vec<Instruction>,
     pub string_table: Vec<String>,
     pub control_state_slots: usize,
+    pub packed_code_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +70,7 @@ pub struct GuardArtifacts {
     pub checksum: u64,
     pub polymorph_seed: u64,
     pub decoy_pool: usize,
+    pub packed_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +404,29 @@ fn insert_control_noise(
     }
 }
 
+fn zigzag_encode(v: i32) -> u32 {
+    ((v << 1) ^ (v >> 31)) as u32
+}
+
+fn encode_varint(mut value: u32, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn pack_instructions(code: &[Instruction]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(code.len() * 4);
+    for inst in code {
+        out.push(inst.opcode);
+        encode_varint(zigzag_encode(inst.a), &mut out);
+        encode_varint(zigzag_encode(inst.b), &mut out);
+        encode_varint(zigzag_encode(inst.c), &mut out);
+    }
+    out
+}
+
 fn encrypt_strings(strings: &[String]) -> Result<(String, String, String), EngineError> {
     let key = {
         let mut bytes = [0u8; 32];
@@ -467,12 +493,15 @@ pub fn protect_script(
     };
     insert_control_noise(&opcode_map, &mut code, polymorph_seed);
     let (encrypted_strings, opaque_key, nonce) = encrypt_strings(&strings)?;
+    let packed_code = pack_instructions(&code);
+    let packed_code_hex = packed_code.encode_hex::<String>();
 
     let bytecode = Bytecode {
         opcode_map: opcode_map.clone(),
         code,
         string_table: strings.clone(),
         control_state_slots: state_slots,
+        packed_code_hex: packed_code_hex.clone(),
     };
 
     let stats = ProtectStats {
@@ -485,6 +514,7 @@ pub fn protect_script(
         checksum: checksum_instructions(&code, &strings),
         polymorph_seed,
         decoy_pool: strings.len().saturating_mul(2) + junk_injected,
+        packed_len: packed_code.len(),
     };
 
     Ok(ProtectedPayload {

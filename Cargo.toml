@@ -16,3 +16,7 @@ aes-gcm = { version = "0.10", features = ["std"] }
 sha2 = "0.10"
 base64 = "0.21"
 thiserror = "1"
+hex = "0.4"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

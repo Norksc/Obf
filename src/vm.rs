@@ -35,9 +35,48 @@ pub fn assemble_loader(payload: &ProtectedPayload) -> String {
     let guard_checksum = payload.guard.checksum;
     let guard_decoy = payload.guard.decoy_pool;
     let guard_seed = payload.guard.polymorph_seed;
+    let guard_packed = payload.guard.packed_len;
+    let packed_hex = &payload.bytecode.packed_code_hex;
     format!(
         r#"local json = require('game'):Service('HttpService')
 local bit = bit32
+local function hex_to_bytes(hex)
+    local bytes = {}
+    for i = 1, #hex, 2 do
+        local byte = tonumber(string.sub(hex, i, i + 1), 16)
+        bytes[#bytes + 1] = byte
+    end
+    return bytes
+end
+local function unpack_code(hex)
+    local bytes = hex_to_bytes(hex)
+    local code = {}
+    local idx = 1
+    local function read_varint()
+        local shift, result = 0, 0
+        while idx <= #bytes do
+            local b = bytes[idx]
+            idx = idx + 1
+            result = result | ((b & 0x7F) << shift)
+            if b & 0x80 == 0 then
+                local value = (result >> 1) ~ (-(result & 1))
+                return value
+            end
+            shift = shift + 7
+        end
+        return nil
+    end
+    while idx <= #bytes do
+        local opcode = bytes[idx]
+        idx = idx + 1
+        local a = read_varint()
+        local b = read_varint()
+        local c = read_varint()
+        if not (a and b and c) then break end
+        code[#code + 1] = { opcode = opcode, a = a, b = b, c = c }
+    end
+    return code
+end
 local function anti_tamper()
     local function bail()
         while true do end
@@ -69,6 +108,8 @@ loader.opcodes = '{opcodes}'
 loader.guard_checksum = {guard_checksum}
 loader.guard_decoy = {guard_decoy}
 loader.guard_seed = {guard_seed}
+loader.guard_packed = {guard_packed}
+loader.packed_hex = '{packed_hex}'
 local function checksum(payload)
     local acc = 0xA5A55A5AF0F0C3C3
     for i = 1, #payload do
@@ -82,8 +123,13 @@ local computed = checksum('{bc}')
 if computed ~= loader.guard_checksum then
     while true do end
 end
+if (#loader.packed_hex / 2) < loader.guard_packed then
+    while true do end
+end
 function loader.run()
     local decoded = json:JSONDecode('{bc}')
+    local packed = unpack_code(loader.packed_hex)
+    decoded.code = packed
     local aes = require('drk_aes')
     local strings = aes.decrypt(loader.enc, loader.key, loader.nonce)
     local vm = require('vm_core')
@@ -100,6 +146,8 @@ return loader
         guard_checksum = guard_checksum,
         guard_decoy = guard_decoy,
         guard_seed = guard_seed,
+        guard_packed = guard_packed,
+        packed_hex = packed_hex,
         bc = bc_serialized,
     )
 }
