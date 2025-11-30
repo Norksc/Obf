@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lua → Custom ISA Compiler</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0c0f17;
+      --panel: #131a26;
+      --accent: #4fd1c5;
+      --text: #e6edf7;
+      --muted: #8fa0bf;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 10% 10%, rgba(79, 209, 197, 0.12), transparent 25%),
+                  radial-gradient(circle at 80% 20%, rgba(64, 99, 255, 0.08), transparent 32%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 32px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .title {
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .badge {
+      padding: 6px 10px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 8px;
+      background: rgba(79, 209, 197, 0.12);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 18px;
+    }
+    section {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 20px 45px rgba(0, 0, 0, 0.28);
+      backdrop-filter: blur(8px);
+    }
+    section h2 {
+      margin: 0 0 12px;
+      font-size: 1rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    textarea, pre, code {
+      width: 100%;
+      font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      border-radius: 10px;
+    }
+    textarea {
+      min-height: 220px;
+      padding: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(0, 0, 0, 0.35);
+      color: var(--text);
+      resize: vertical;
+    }
+    button {
+      background: linear-gradient(120deg, #4fd1c5, #82a0ff);
+      color: #041019;
+      font-weight: 800;
+      border: none;
+      padding: 10px 14px;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: transform 120ms ease, box-shadow 160ms ease;
+      margin-top: 10px;
+      width: 100%;
+    }
+    button:hover { transform: translateY(-1px); box-shadow: 0 12px 28px rgba(79, 209, 197, 0.25); }
+    button:active { transform: translateY(0); box-shadow: none; }
+    .output {
+      min-height: 200px;
+      background: #0b111d;
+      color: #9cd5ff;
+      padding: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      overflow-wrap: anywhere;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      color: var(--muted);
+    }
+    th, td {
+      padding: 6px 4px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      text-align: left;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text);
+      font-size: 0.85rem;
+    }
+    .small { color: var(--muted); font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">High-Efficiency Lua → Custom ISA Compiler</div>
+    <div class="badge">Dynamic Opcode Mapping · Bit-Packed</div>
+  </header>
+
+  <div class="grid">
+    <section>
+      <h2>Lua Source</h2>
+      <textarea id="source">local a = 3
+local b = 9
+c = a + b
+return c</textarea>
+      <button id="compile">Compile to Bitstream</button>
+      <div class="small">Randomized opcode IDs are regenerated each run to stress the dispatch layer.</div>
+    </section>
+
+    <section>
+      <h2>Binary Output</h2>
+      <div class="pill" id="bitStats">0 bits · 0 bytes</div>
+      <pre class="output" id="hex"></pre>
+      <table id="opcodeTable"></table>
+    </section>
+
+    <section>
+      <h2>Lua Runtime (Register VM)</h2>
+      <pre class="output" style="color:#9ef7c4" id="luaRuntime"></pre>
+    </section>
+  </div>
+
+  <script>
+    const ORDER = ["LoadK", "Move", "Add", "Sub", "Mul", "Div", "Return", "Halt"];
+
+    function shufflePool(limit) {
+      const pool = Array.from({ length: 64 }, (_, i) => i);
+      for (let i = pool.length - 1; i > 0; i--) {
+        const r = crypto.getRandomValues(new Uint32Array(1))[0] % (i + 1);
+        [pool[i], pool[r]] = [pool[r], pool[i]];
+      }
+      return pool.slice(0, limit);
+    }
+
+    class BitWriter {
+      constructor() {
+        this.data = [];
+        this.acc = 0;
+        this.used = 0;
+        this.totalBits = 0;
+      }
+      write(value, width) {
+        for (let i = width - 1; i >= 0; i--) {
+          const bit = (value >> i) & 1;
+          this.acc |= bit << (7 - this.used);
+          this.used += 1;
+          this.totalBits += 1;
+          if (this.used === 8) {
+            this.data.push(this.acc);
+            this.acc = 0;
+            this.used = 0;
+          }
+        }
+      }
+      finalize() {
+        if (this.used > 0) this.data.push(this.acc);
+        return { bytes: this.data, bits: this.totalBits };
+      }
+    }
+
+    function clampImm10(n) {
+      const clamped = Math.max(-512, Math.min(511, Number(n)));
+      return clamped & 0x3ff;
+    }
+
+    function parseLines(input) {
+      const lines = input.split(/\n|;/).map(l => l.trim()).filter(Boolean);
+      const symbols = new Map();
+      let nextReg = 0;
+      const ensureReg = (name) => {
+        if (symbols.has(name)) return symbols.get(name);
+        symbols.set(name, nextReg);
+        return nextReg++;
+      };
+      const parseOperand = (token) => {
+        const num = Number(token);
+        return Number.isFinite(num) && token.match(/^[-+]?\d+(\.\d+)?$/)
+          ? { kind: "imm", value: num }
+          : { kind: "reg", value: ensureReg(token) };
+      };
+
+      const instructions = [];
+      for (const line of lines) {
+        if (line.startsWith("return ")) {
+          const reg = ensureReg(line.replace("return", "").trim());
+          instructions.push({ op: "Return", dst: reg });
+          continue;
+        }
+        if (line === "halt") { instructions.push({ op: "Halt" }); continue; }
+        const [lhs, rhs] = line.split("=").map(s => s.trim());
+        const dst = ensureReg(lhs);
+        if (!rhs) continue;
+        const match = rhs.match(/(.+)([+\-*\/])(.+)/);
+        if (match) {
+          const a = parseOperand(match[1].trim());
+          const b = parseOperand(match[3].trim());
+          const opSym = match[2];
+          const op = {"+":"Add","-":"Sub","*":"Mul","/":"Div"}[opSym];
+          instructions.push({ op, dst, a, b });
+          continue;
+        }
+        const operand = parseOperand(rhs);
+        if (operand.kind === "imm") instructions.push({ op: "LoadK", dst, imm: operand.value });
+        else instructions.push({ op: "Move", dst, src: operand.value });
+      }
+      instructions.push({ op: "Halt" });
+      return instructions;
+    }
+
+    function encode(instructions) {
+      const ids = shufflePool(ORDER.length);
+      const map = new Map(ORDER.map((op, idx) => [op, ids[idx]]));
+      const writer = new BitWriter();
+      writer.write(ORDER.length, 6);
+      for (const op of ORDER) writer.write(map.get(op), 6);
+
+      for (const instr of instructions) {
+        const opcode = map.get(instr.op);
+        const emit = (immFlag, dst, ra, payload, payloadWidth) => {
+          writer.write(opcode, 6);
+          writer.write(immFlag, 1);
+          writer.write(dst, 5);
+          writer.write(ra, 5);
+          writer.write(payload, payloadWidth);
+        };
+        switch (instr.op) {
+          case "LoadK": emit(1, instr.dst, 0, clampImm10(instr.imm), 10); break;
+          case "Move": emit(0, instr.dst, instr.src, 0, 5); break;
+          case "Return": emit(0, instr.dst ?? instr.src, 0, 0, 5); break;
+          case "Halt": emit(0, 0, 0, 0, 5); break;
+          default: {
+            const ra = instr.a.kind === "reg" ? instr.a.value : 0;
+            if (instr.b.kind === "reg") emit(0, instr.dst, ra, instr.b.value, 5);
+            else emit(1, instr.dst, ra, clampImm10(instr.b.value), 10);
+          }
+        }
+      }
+      return { ...writer.finalize(), map };
+    }
+
+    function toHex(bytes) {
+      return bytes.map(b => b.toString(16).padStart(2, "0").toUpperCase()).join(" ");
+    }
+
+    function renderOpcodes(map) {
+      const table = document.getElementById("opcodeTable");
+      table.innerHTML = `<tr><th>Opcode</th><th>Dynamic ID</th></tr>` +
+        ORDER.map(op => `<tr><td>${op}</td><td>${map.get(op)}</td></tr>`).join("");
+    }
+
+    function compileUI() {
+      const instructions = parseLines(document.getElementById("source").value);
+      const { bytes, bits, map } = encode(instructions);
+      document.getElementById("hex").textContent = toHex(bytes);
+      document.getElementById("bitStats").textContent = `${bits} bits · ${bytes.length} bytes`;
+      renderOpcodes(map);
+    }
+
+    const runtime = `local ORDER = {"LoadK","Move","Add","Sub","Mul","Div","Return","Halt"}
+local function read_bits(state, n)
+  local v = 0
+  for _=1,n do
+    local byte = state.stream[state.byte_index]
+    local bit = bit32.band(bit32.rshift(byte, 7 - state.bit_index), 1)
+    v = bit32.bor(bit32.lshift(v,1), bit)
+    state.bit_index = state.bit_index + 1
+    if state.bit_index == 8 then state.bit_index = 0 state.byte_index = state.byte_index + 1 end
+  end
+  return v
+end
+
+local function sign10(v)
+  return bit32.band(v,0x200) ~= 0 and (v - 0x400) or v
+end
+
+local function run(stream)
+  local state = {stream=stream, byte_index=1, bit_index=0}
+  local mapping = {}
+  local count = read_bits(state,6)
+  for i=1,count do mapping[read_bits(state,6)] = ORDER[i] end
+  local reg = table.create(32,0)
+  local results = {}
+  while state.byte_index <= #stream do
+    local opcode = read_bits(state,6)
+    local imm = read_bits(state,1)
+    local rd = read_bits(state,5)
+    local ra = read_bits(state,5)
+    local payload = imm==1 and read_bits(state,10) or read_bits(state,5)
+    local op = mapping[opcode]
+    local operand = imm==1 and sign10(payload) or reg[payload+1]
+    if op == "LoadK" then reg[rd+1] = operand
+    elseif op == "Move" then reg[rd+1] = reg[ra+1]
+    elseif op == "Add" then reg[rd+1] = reg[ra+1] + operand
+    elseif op == "Sub" then reg[rd+1] = reg[ra+1] - operand
+    elseif op == "Mul" then reg[rd+1] = reg[ra+1] * operand
+    elseif op == "Div" then reg[rd+1] = reg[ra+1] / operand
+    elseif op == "Return" then results[#results+1] = reg[rd+1]
+    elseif op == "Halt" then break end
+  end
+  return results
+end`;
+
+    document.getElementById("luaRuntime").textContent = runtime;
+    document.getElementById("compile").addEventListener("click", compileUI);
+    compileUI();
+  </script>
+</body>
+</html>
