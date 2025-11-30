@@ -3,8 +3,9 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use poise::serenity_prelude as serenity;
 use reqwest::Client;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task;
+use tokio::time::{timeout, Duration};
 
 mod engine;
 mod vm;
@@ -14,6 +15,8 @@ const PLATOBOOST_PROJECT: &str = "3035";
 const PLATOBOOST_SECRET: &str = "e787153b-65f0-4a2a-b209-7bf2ddf2b8bc";
 const DISCORD_TOKEN: &str = "boy here";
 const ALERT_WEBHOOK: &str = "https://discord.com/api/webhooks/1444255368862503025/Mo6YV19ixBbwb4CRYg4HFV0iBcc7zenjK6PCHKG8AOmKDzcVqe1Nut8BLPtneQPnLTk7";
+const WORKER_COUNT: usize = 4;
+const WORKER_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Debug)]
 struct Session {
@@ -77,6 +80,15 @@ fn platoboost_link(user_id: u64) -> String {
     )
 }
 
+fn build_http_client() -> anyhow::Result<Client> {
+    Ok(Client::builder()
+        .user_agent("drk-v3-bot")
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(8)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build()?)
+}
+
 async fn verify_key(client: &Client, key: &str) -> anyhow::Result<bool> {
     let url = format!(
         "https://api.platoboost.com/v1/public/verify?public_key={}&key={}",
@@ -113,39 +125,63 @@ async fn send_webhook_file(client: &Client, user_id: u64, filename: &str, bytes:
     let _ = client.post(ALERT_WEBHOOK).multipart(form).send().await;
 }
 
-async fn start_consumer(mut rx: ProcessingQueueReceiver, bot: BotData) {
-    while let Some(item) = rx.recv().await {
+async fn start_consumers(rx: ProcessingQueueReceiver, bot: BotData) {
+    let shared_rx = Arc::new(Mutex::new(rx));
+    for worker_idx in 0..WORKER_COUNT {
+        let rx_handle = shared_rx.clone();
         let bot_clone = bot.clone();
         task::spawn(async move {
-            match task::spawn_blocking(move || engine::protect_script(item.file_bytes, item.option))
-                .await
-            {
-                Ok(Ok(protected)) => {
-                    let payload = vm::assemble_loader(&protected);
-                    let content = format!(
-                        "✅ Encryption complete (option: {:?}). Key: {}\n````lua\n{}\n````",
-                        item.option, protected.opaque_key, payload
-                    );
-                    let _ = item
-                        .channel_id
-                        .send_message(bot_clone.discord_http.as_ref(), |m| m.content(content))
-                        .await;
-                }
-                Ok(Err(e)) => {
-                    let _ = item
-                        .channel_id
-                        .send_message(bot_clone.discord_http.as_ref(), |m| {
-                            m.content(format!("❌ Failed to encrypt: {}", e))
-                        })
-                        .await;
-                }
-                Err(join_err) => {
-                    let _ = item
-                        .channel_id
-                        .send_message(bot_clone.discord_http.as_ref(), |m| {
-                            m.content(format!("❌ Worker join error: {}", join_err))
-                        })
-                        .await;
+            loop {
+                let maybe_item = {
+                    let mut guard = rx_handle.lock().await;
+                    guard.recv().await
+                };
+                let Some(item) = maybe_item else { break }; // channel closed
+
+                let worker = task::spawn_blocking(move || {
+                    engine::protect_script(item.file_bytes, item.option)
+                });
+                match timeout(WORKER_TIMEOUT, worker).await {
+                    Ok(Ok(Ok(protected))) => {
+                        let payload = vm::assemble_loader(&protected);
+                        let content = format!(
+                            "✅ Encryption complete (worker {} / option: {:?}). Key: {}\n````lua\n{}\n````",
+                            worker_idx,
+                            item.option,
+                            protected.opaque_key,
+                            payload
+                        );
+                        let _ = item
+                            .channel_id
+                            .send_message(bot_clone.discord_http.as_ref(), |m| m.content(content))
+                            .await;
+                    }
+                    Ok(Ok(Err(e))) => {
+                        let _ = item
+                            .channel_id
+                            .send_message(bot_clone.discord_http.as_ref(), |m| {
+                                m.content(format!("❌ Failed to encrypt: {}", e))
+                            })
+                            .await;
+                    }
+                    Ok(Err(join_err)) => {
+                        let _ = item
+                            .channel_id
+                            .send_message(bot_clone.discord_http.as_ref(), |m| {
+                                m.content(format!("❌ Worker join error: {}", join_err))
+                            })
+                            .await;
+                    }
+                    Err(_) => {
+                        let _ = item
+                            .channel_id
+                            .send_message(bot_clone.discord_http.as_ref(), |m| {
+                                m.content(
+                                    "⏱️ التشفير استغرق وقتاً طويلاً وتم إيقافه لإبقاء البوت سريعاً.",
+                                )
+                            })
+                            .await;
+                    }
                 }
             }
         });
@@ -375,7 +411,7 @@ async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt::init();
     let sessions: Sessions = Arc::new(DashMap::new());
     let (tx, rx) = mpsc::channel(128);
-    let http_client = Client::builder().user_agent("drk-v3-bot").build()?;
+    let http_client = build_http_client()?;
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -400,7 +436,7 @@ async fn main() -> Result<(), anyhow::Error> {
             };
 
             let consumer_data = data.clone();
-            tokio::spawn(start_consumer(rx, consumer_data));
+            tokio::spawn(start_consumers(rx, consumer_data));
 
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
