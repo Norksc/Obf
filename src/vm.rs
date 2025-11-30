@@ -1,0 +1,71 @@
+use crate::engine::{Bytecode, ProtectedPayload};
+use base64::{engine::general_purpose, Engine as _};
+
+fn encode_opcode_map(map: &std::collections::HashMap<crate::engine::Opcode, u8>) -> String {
+    let mut pairs: Vec<String> = map
+        .iter()
+        .map(|(op, id)| format!("{}:{}", format_opcode(op), id))
+        .collect();
+    pairs.sort();
+    pairs.join(",")
+}
+
+fn format_opcode(op: &crate::engine::Opcode) -> &'static str {
+    match op {
+        crate::engine::Opcode::Move => "MOVE",
+        crate::engine::Opcode::LoadK => "LOADK",
+        crate::engine::Opcode::Add => "ADD",
+        crate::engine::Opcode::Sub => "SUB",
+        crate::engine::Opcode::Mul => "MUL",
+        crate::engine::Opcode::Div => "DIV",
+        crate::engine::Opcode::Jump => "JUMP",
+        crate::engine::Opcode::Return => "RETURN",
+        crate::engine::Opcode::Nop => "NOP",
+    }
+}
+
+fn serialize_bytecode(bytecode: &Bytecode) -> String {
+    serde_json::to_string(bytecode).unwrap_or_default()
+}
+
+pub fn assemble_loader(payload: &ProtectedPayload) -> String {
+    let bc_serialized = serialize_bytecode(&payload.bytecode);
+    let watermark = "Protected by Drk V3";
+    let encoded_opcodes = encode_opcode_map(&payload.bytecode.opcode_map);
+    format!(
+        r#"local json = require('game'):Service('HttpService')
+local bit = bit32
+local function anti_tamper()
+    local ok, info = pcall(debug.info, 1, 's')
+    if ok and info then
+        if tostring(info):find('HttpService') or getfenv then
+            while true do end
+        end
+    end
+end
+anti_tamper()
+local loader = {}
+loader.meta = '{meta}'
+loader.enc = '{enc}'
+loader.nonce = '{nonce}'
+loader.key = '{key}'
+loader.watermark = '{watermark}'
+loader.opcodes = '{opcodes}'
+function loader.run()
+    local decoded = json:JSONDecode('{bc}')
+    local aes = require('drk_aes')
+    local strings = aes.decrypt(loader.enc, loader.key, loader.nonce)
+    local vm = require('vm_core')
+    return vm.execute(decoded, strings, loader.opcodes, loader.watermark)
+end
+return loader
+"#,
+        meta = general_purpose::STANDARD.encode(watermark.as_bytes()),
+        enc = payload.encrypted_strings,
+        nonce = payload.nonce,
+        key = payload.opaque_key,
+        watermark = watermark,
+        opcodes = encoded_opcodes,
+        bc = bc_serialized,
+    )
+}
